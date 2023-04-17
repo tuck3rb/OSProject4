@@ -4,7 +4,7 @@ use std::path::Path;
 use nix::unistd::{fork, ForkResult};
 use nix::sys::wait::waitpid;
 use std::ffi::CString;
-use nix::unistd::{pipe, dup2, execvp};
+use nix::{fcntl::{OFlag, open}, sys::stat::Mode, unistd::{pipe, close, dup2, execvp}}; //, write}};
 
 fn main() {
     loop {
@@ -14,7 +14,7 @@ fn main() {
         let mut user_input = String::new();
         // following line was crafted by ChatGPT using the prompt: "I'm making a basic shell, why doesn't it read my user input correctly [code]"
         io::stdin().read_line(&mut user_input).unwrap();
-        let mut user_input = user_input.trim();
+        let user_input = user_input.trim();
 
         if user_input == "exit" {
             break;
@@ -44,10 +44,24 @@ fn pipe_kickoff(mut user_input: &str) -> anyhow::Result<()> {
     // Cstring vec for each command -- didn't work need i32
     // let mut pipes: Vec<Vec<CString>> = Vec::new();
     // heavily influenced by fork_ls_demo.rs from class
+
+    let mut output_fd = 1;
+
     let background = user_input.ends_with("&");
     if background {
         user_input = &user_input[..user_input.len() -1]
     }
+
+    if user_input.contains('>') {
+        let parts: Vec<&str> = user_input.split('>').collect();
+        user_input = parts[0].trim();
+        let file_name = parts[1].trim();
+        // output_file = Some(File::create(file_name)?);
+        let flags: OFlag = [OFlag::O_CREAT, OFlag::O_WRONLY, OFlag::O_TRUNC].iter().copied().collect();
+        let mode: Mode = [Mode::S_IRUSR, Mode::S_IWUSR].iter().copied().collect();
+        output_fd = open(file_name, flags, mode)?;
+    }
+
     let commands: Vec<&str> = user_input.split("|").collect();
     match unsafe { fork()? } {
         ForkResult::Parent { child, .. } => {
@@ -61,11 +75,17 @@ fn pipe_kickoff(mut user_input: &str) -> anyhow::Result<()> {
         }
         ForkResult::Child => {
             // for loop of commands
-            let mut output_fd = 1;
             for i in (0..commands.len()).rev() {
                 let get_args = externalize(commands[i]);
                 eprintln!("command {i}: {:?}", get_args);
                 if i == 0 {
+                    if user_input.contains('<') {
+                        let parts: Vec<&str> = user_input.split('<').collect();
+                        user_input = parts[0].trim();
+                        let file_name = parts[1].trim();
+                        let input_fd = open(file_name, OFlag::O_RDONLY, Mode::empty())?;
+                        dup2(input_fd, 0)?;
+                    }
                     eprintln!("redirect out to {output_fd}");
                     dup2(output_fd, 1)?;
                     match execvp(&get_args[0], &get_args) {
@@ -84,6 +104,7 @@ fn pipe_kickoff(mut user_input: &str) -> anyhow::Result<()> {
                     match unsafe {fork()?} {
                         ForkResult::Parent { child:_, .. } => {
                             eprintln!("redirect in to {read_fd}, out to {output_fd}");
+                            close(write_fd)?;
                             dup2(read_fd, 0)?;
                             dup2(output_fd, 1)?;
                             println!("executing");
@@ -100,11 +121,11 @@ fn pipe_kickoff(mut user_input: &str) -> anyhow::Result<()> {
                         }
                         ForkResult::Child => {
                             output_fd = write_fd;
+                            close(read_fd)?;
                         }
                     }
                 }
             }
-
         }
     }
     Ok(())
